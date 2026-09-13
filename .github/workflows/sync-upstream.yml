@@ -1,0 +1,152 @@
+name: Sync Upstream Release to GitLink
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get upstream latest release
+        id: upstream
+        run: |
+          UPSTREAM_REPO="StrawberryPerl/Perl-Dist-Strawberry"
+          echo "[INFO] 上游仓库: $UPSTREAM_REPO"
+
+          RESP=$(curl -sL -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$UPSTREAM_REPO/releases/latest")
+
+          TAG=$(echo "$RESP" | jq -r '.tag_name')
+          NAME=$(echo "$RESP" | jq -r '.name')
+
+          echo "[INFO] 上游版本 tag: $TAG"
+          echo "[INFO] 上游版本名称: $NAME"
+
+          echo "tag=$TAG"   >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          echo "$RESP" | jq -r '.body' > /tmp/release-body.txt
+          echo ""
+
+      - name: Check if release exists on GitLink
+        id: check
+        env:
+          GITLINK_TOKEN: ${{ secrets.GITLINK_TOKEN }}
+          GITLINK_REPO: "hestiacn/Perl"
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+
+          RESP=$(curl -sL \
+            -H "Authorization: Bearer ${GITLINK_TOKEN}" \
+            "https://www.gitlink.org.cn/api/${GITLINK_REPO}/releases.json")
+
+          EXISTS=$(echo "$RESP" | jq -r ".releases[] | select(.tag_name == \"${TAG}\") | .tag_name")
+
+          if [ -n "$EXISTS" ]; then
+            echo "[INFO] Release $TAG 已存在，跳过"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "[INFO] Release $TAG 不存在，需要创建"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+          echo ""
+
+      - name: Download upstream assets
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          UPSTREAM_REPO="StrawberryPerl/Perl-Dist-Strawberry"
+          mkdir -p /tmp/release
+          curl -sL "https://api.github.com/repos/$UPSTREAM_REPO/releases/latest" \
+            | jq -r '.assets[] | "\(.browser_download_url) \(.name)"' \
+            | while read url name; do
+                echo "[INFO] 下载: $name"
+                curl -sL -o "/tmp/release/$name" "$url"
+                if [ -f "/tmp/release/$name" ]; then
+                  size=$(du -h "/tmp/release/$name" | cut -f1)
+                  echo "[INFO] 完成: $name ($size)"
+                fi
+              done
+
+          echo ""
+          ls -lh /tmp/release/
+          echo ""
+
+      - name: Upload attachments to GitLink
+        if: steps.check.outputs.exists == 'false'
+        id: attachments
+        env:
+          GITLINK_TOKEN: ${{ secrets.GITLINK_TOKEN }}
+        run: |
+          ATTACHMENT_IDS="[]"
+          COUNT=0
+          FAILED=0
+
+          for f in /tmp/release/*; do
+            name=$(basename "$f")
+            COUNT=$((COUNT + 1))
+            size=$(du -h "$f" | cut -f1)
+
+            echo "[INFO] [$COUNT] 上传: $name ($size)"
+
+            RESP=$(curl -sL -X POST \
+              "https://www.gitlink.org.cn/api/attachments.json" \
+              -H "Authorization: Bearer ${GITLINK_TOKEN}" \
+              -F "file=@${f}")
+
+            ATT_ID=$(echo "$RESP" | jq -r '.id')
+
+            if [ "$ATT_ID" != "null" ] && [ -n "$ATT_ID" ]; then
+              echo "[INFO] 上传成功"
+              ATTACHMENT_IDS=$(echo "$ATTACHMENT_IDS" | jq -c ". += [\"$ATT_ID\"]" | tr -d '\n')
+            else
+              FAILED=$((FAILED + 1))
+              echo "[ERROR] 上传失败: $name"
+            fi
+            echo ""
+          done
+
+          echo "=========================================="
+          echo "[INFO] 上传完成"
+          echo "[INFO] 成功: $((COUNT - FAILED)) / 总数: $COUNT / 失败: $FAILED"
+          echo "=========================================="
+          echo ""
+
+          echo "ids=$ATTACHMENT_IDS" >> $GITHUB_OUTPUT
+
+      - name: Create GitLink release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GITLINK_TOKEN: ${{ secrets.GITLINK_TOKEN }}
+          GITLINK_REPO: "hestiacn/Perl"
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          TITLE="${{ steps.upstream.outputs.name }}"
+          ATTACHMENT_IDS='${{ steps.attachments.outputs.ids }}'
+          BODY=$(jq -Rs . < /tmp/release-body.txt)
+
+          echo "[INFO] 仓库: $GITLINK_REPO"
+          echo "[INFO] Tag: $TAG"
+          echo "[INFO] 标题: $TITLE"
+          echo "[INFO] 附件数: $(echo "$ATTACHMENT_IDS" | jq 'length')"
+          echo ""
+
+          RESP=$(curl -sL -X POST \
+            "https://www.gitlink.org.cn/api/${GITLINK_REPO}/releases.json" \
+            -H "Authorization: Bearer ${GITLINK_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachment_ids\": ${ATTACHMENT_IDS},
+              \"body\": ${BODY},
+              \"name\": \"${TITLE}\",
+              \"tag_name\": \"${TAG}\",
+              \"target_commitish\": \"master\",
+              \"draft\": false,
+              \"prerelease\": false
+            }")
+
+          STATUS=$(echo "$RESP" | jq -r '.status')
+          if [ "$STATUS" = "0" ]; then
+          else
+            exit 1
+          fi
