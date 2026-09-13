@@ -42,7 +42,18 @@ jobs:
             "https://www.gitlink.org.cn/api/${GITLINK_REPO}/releases.json")
 
           EXISTS=$(echo "$RESP" | jq -r ".releases[] | select(.tag_name == \"${TAG}\") | .tag_name")
-
+          STATUS=$(echo "$RESP" | jq -r '.status')
+          TOTAL=$(echo "$RESP" | jq -r '.total_count')
+          echo "[INFO] API 状态: $STATUS"
+          echo "[INFO] Release 总数: $TOTAL"
+          if [ "$STATUS" != "0" ]; then
+          echo "[ERROR] API 返回错误"
+          echo "$RESP" | jq '.'
+          exit 1
+          fi
+          EXISTS=$(echo "$RESP" | jq -r ".releases[]? | select(.tag_name == \"${TAG}\") | .tag_name" | head -1)
+          echo "[INFO] 检查 tag: $TAG"
+          echo "[INFO] 匹配结果: '$EXISTS'"
           if [ -n "$EXISTS" ]; then
             echo "[INFO] Release $TAG 已存在，跳过"
             echo "exists=true" >> $GITHUB_OUTPUT
