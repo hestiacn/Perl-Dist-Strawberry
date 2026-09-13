@@ -5,6 +5,9 @@ on:
     - cron: '0 3 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -29,6 +32,27 @@ jobs:
           echo "$RESP" | jq -r '.body' > /tmp/release-body.txt
           echo ""
 
+      - name: Check if release exists on My GitHub
+        id: check_github
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          MY_REPO="${{ github.repository }}"
+
+          HTTP_CODE=$(curl -sL -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/${MY_REPO}/releases/tags/${TAG}")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "[INFO] Release $TAG 已存在于 GitHub"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "[INFO] Release $TAG 不存在于 GitHub"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+          echo ""
+
       - name: Check if release exists on GitLink
         id: check
         env:
@@ -41,33 +65,34 @@ jobs:
             -H "Authorization: Bearer ${GITLINK_TOKEN}" \
             "https://www.gitlink.org.cn/api/${GITLINK_REPO}/releases.json")
 
-          EXISTS=$(echo "$RESP" | jq -r ".releases[] | select(.tag_name == \"${TAG}\") | .tag_name")
           STATUS=$(echo "$RESP" | jq -r '.status')
           TOTAL=$(echo "$RESP" | jq -r '.total_count')
+
           echo "[INFO] API 状态: $STATUS"
           echo "[INFO] Release 总数: $TOTAL"
+
           if [ "$STATUS" != "0" ]; then
-          echo "[ERROR] API 返回错误"
-          echo "$RESP" | jq '.'
-          exit 1
+            echo "[ERROR] API 返回错误"
+            exit 1
           fi
+
           EXISTS=$(echo "$RESP" | jq -r ".releases[]? | select(.tag_name == \"${TAG}\") | .tag_name" | head -1)
-          echo "[INFO] 检查 tag: $TAG"
-          echo "[INFO] 匹配结果: '$EXISTS'"
+
           if [ -n "$EXISTS" ]; then
-            echo "[INFO] Release $TAG 已存在，跳过"
+            echo "[INFO] Release $TAG 已存在于 GitLink"
             echo "exists=true" >> $GITHUB_OUTPUT
           else
-            echo "[INFO] Release $TAG 不存在，需要创建"
+            echo "[INFO] Release $TAG 不存在于 GitLink"
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
           echo ""
 
       - name: Download upstream assets
-        if: steps.check.outputs.exists == 'false'
+        if: steps.check_github.outputs.exists == 'false' || steps.check.outputs.exists == 'false'
         run: |
           UPSTREAM_REPO="StrawberryPerl/Perl-Dist-Strawberry"
           mkdir -p /tmp/release
+
           curl -sL "https://api.github.com/repos/$UPSTREAM_REPO/releases/latest" \
             | jq -r '.assets[] | "\(.browser_download_url) \(.name)"' \
             | while read url name; do
@@ -81,6 +106,33 @@ jobs:
 
           echo ""
           ls -lh /tmp/release/
+          echo ""
+
+      - name: Create GitHub release
+        if: steps.check_github.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          TITLE="${{ steps.upstream.outputs.name }}"
+          MY_REPO="${{ github.repository }}"
+
+          echo "[INFO] 仓库: $MY_REPO"
+          echo "[INFO] Tag: $TAG"
+          echo "[INFO] 标题: $TITLE"
+          echo ""
+
+          gh release create "$TAG" /tmp/release/* \
+            --repo "$MY_REPO" \
+            --title "$TITLE" \
+            --notes-file /tmp/release-body.txt
+
+          if [ $? -eq 0 ]; then
+            echo "[INFO] GitHub Release 创建成功"
+          else
+            echo "[ERROR] GitHub Release 创建失败"
+            exit 1
+          fi
           echo ""
 
       - name: Upload attachments to GitLink
@@ -117,10 +169,7 @@ jobs:
             echo ""
           done
 
-          echo "=========================================="
-          echo "[INFO] 上传完成"
-          echo "[INFO] 成功: $((COUNT - FAILED)) / 总数: $COUNT / 失败: $FAILED"
-          echo "=========================================="
+          echo "[INFO] 上传完成: 成功 $((COUNT - FAILED)) / 总数 $COUNT / 失败 $FAILED"
           echo ""
 
           echo "ids=$ATTACHMENT_IDS" >> $GITHUB_OUTPUT
@@ -136,9 +185,7 @@ jobs:
           ATTACHMENT_IDS='${{ steps.attachments.outputs.ids }}'
           BODY=$(jq -Rs . < /tmp/release-body.txt)
 
-          echo "[INFO] 仓库: $GITLINK_REPO"
           echo "[INFO] Tag: $TAG"
-          echo "[INFO] 标题: $TITLE"
           echo "[INFO] 附件数: $(echo "$ATTACHMENT_IDS" | jq 'length')"
           echo ""
 
@@ -158,6 +205,8 @@ jobs:
 
           STATUS=$(echo "$RESP" | jq -r '.status')
           if [ "$STATUS" = "0" ]; then
+            echo "[INFO] GitLink Release 创建成功"
           else
+            echo "[ERROR] GitLink Release 创建失败"
             exit 1
           fi
